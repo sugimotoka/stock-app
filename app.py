@@ -56,7 +56,7 @@ def fetch_4h_usual_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_jp_4h_sessions_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
-    """日本株：前場/後場を各1本にまとめる（2本/日）"""
+    """日本株：前場/後場を各1本にまとめる（2本/日）。市場外・夜はYahooが1分足を返さない場合あり。"""
     days = max(1, min(int(days), 7))
     df = yf.download(ticker, interval="1m", period=f"{days}d", progress=False)
     if df is None or df.empty:
@@ -78,22 +78,96 @@ def fetch_jp_4h_sessions_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
             "Volume": x["Volume"].sum(),
         })
 
-    df_m = morning.groupby(morning.index.date).apply(ohlcv)
-    df_a = afternoon.groupby(afternoon.index.date).apply(ohlcv)
+    if morning.empty and afternoon.empty:
+        return pd.DataFrame()
+
+    df_m = morning.groupby(morning.index.date).apply(ohlcv) if not morning.empty else pd.DataFrame()
+    df_a = afternoon.groupby(afternoon.index.date).apply(ohlcv) if not afternoon.empty else pd.DataFrame()
 
     # 見た目の時刻ラベル
-    df_m.index = pd.to_datetime(df_m.index) + pd.Timedelta(hours=11, minutes=30)
-    df_a.index = pd.to_datetime(df_a.index) + pd.Timedelta(hours=15)
+    if not df_m.empty:
+        df_m.index = pd.to_datetime(df_m.index) + pd.Timedelta(hours=11, minutes=30)
+    if not df_a.empty:
+        df_a.index = pd.to_datetime(df_a.index) + pd.Timedelta(hours=15)
 
     df_4h = pd.concat([df_m, df_a]).sort_index().dropna()
     return df_4h
 
 
+def make_pseudo_4h_from_daily(df_daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    日本株用フォールバック：
+    日足を「前場」「後場」相当に2分割した疑似4H（夜・休日でも必ず出す）
+    """
+    df_daily = df_daily.copy()
+    if df_daily is None or df_daily.empty:
+        return pd.DataFrame()
+
+    if isinstance(df_daily.columns, pd.MultiIndex):
+        df_daily.columns = df_daily.columns.get_level_values(0)
+
+    df_daily = df_daily.dropna()
+    df_daily.index = pd.to_datetime(df_daily.index)
+
+    rows = []
+    for idx, r in df_daily.iterrows():
+        o = float(r["Open"])
+        h = float(r["High"])
+        l = float(r["Low"])
+        c = float(r["Close"])
+        v = float(r.get("Volume", 0.0))
+
+        mid = (o + c) / 2.0
+
+        # 前場（11:30）
+        rows.append({
+            "Datetime": idx + pd.Timedelta(hours=11, minutes=30),
+            "Open": o,
+            "High": h,
+            "Low": l,
+            "Close": mid,
+            "Volume": v / 2.0
+        })
+
+        # 後場（15:00）
+        rows.append({
+            "Datetime": idx + pd.Timedelta(hours=15),
+            "Open": mid,
+            "High": h,
+            "Low": l,
+            "Close": c,
+            "Volume": v / 2.0
+        })
+
+    df = pd.DataFrame(rows).set_index("Datetime")
+    df = df.sort_index().dropna()
+    return df
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_4h_auto(ticker: str, days: int = 7) -> pd.DataFrame:
-    """4H自動：日本株は前場/後場、その他は通常4H"""
+    """
+    4H自動：
+    - 日本株（.T）: まず1分足→前場/後場を試す
+      失敗したら 日足→疑似4H にフォールバック（夜・休日でも必ず表示）
+    - それ以外: 1分足→通常4H
+    """
+    days = max(1, min(int(days), 7))
+
     if is_jp_equity(ticker):
-        return fetch_jp_4h_sessions_from_1m(ticker, days=days)
+        # ① まず本物（1分足→前場/後場）
+        df = fetch_jp_4h_sessions_from_1m(ticker, days=days)
+        if df is not None and not df.empty:
+            return df
+
+        # ② フォールバック（日足→疑似4H）
+        df_daily = cached_download(ticker, interval="1d", period="60d")
+        if df_daily is not None and not df_daily.empty:
+            return make_pseudo_4h_from_daily(df_daily)
+
+        return pd.DataFrame()
+
+    # 米株など
     return fetch_4h_usual_from_1m(ticker, days=days)
 
 
@@ -160,7 +234,7 @@ def calc_score(row, prev_row):
     elif row["Close"] > row["BB_upper"]:
         s -= 1
 
-    # OBV（微差ノイズを抑える：0.1%相当以上のみ評価）
+    # OBV（微差ノイズを抑える）
     obv_delta = row["OBV"] - prev_row["OBV"]
     thresh = abs(prev_row["OBV"]) * 0.001 if abs(prev_row["OBV"]) > 0 else 0
     if obv_delta > thresh:
@@ -187,7 +261,7 @@ st.sidebar.subheader("設定")
 
 preset = st.sidebar.selectbox(
     "よく使う銘柄",
-    ["（手入力）", "7203.T トヨタ", "6758.T ソニー", "9984.T SBグループ", "AAPL Apple"],
+    ["（手入力）", "7203.T トヨタ", "6758.T ソニー", "9984.T SBグループ", "8306.T 三菱UFJ", "AAPL Apple", "MSFT Microsoft"],
     index=0
 )
 
@@ -274,7 +348,7 @@ if run and ticker:
 
     # 日足フィルタ強制（逆行は0にする）
     score_today, filter_msg_today = enforce_daily_filter(score_today, daily_trend)
-    score_yesterday, filter_msg_yesterday = enforce_daily_filter(score_yesterday, daily_trend)
+    score_yesterday, _ = enforce_daily_filter(score_yesterday, daily_trend)
 
     # bias（ATRライン表示用）
     bias = "neutral"
@@ -384,7 +458,6 @@ if run and ticker:
     col1, col2 = st.columns(2)
 
     with col1:
-        # 判定（フィルタ後のscore）
         if score_today >= 3:
             bg, label = "#00C851", "🟢🟢 強い買い"
         elif score_today >= 1:
@@ -403,7 +476,6 @@ if run and ticker:
         <span style='color:white;font-size:12px'>スコア：{score_today}（前回：{score_yesterday}）</span>
         </div>""", unsafe_allow_html=True)
 
-        # 転換トリガー
         buy_triggers, sell_triggers = [], []
 
         if latest["MACD"] > latest["MACD_signal"] and prev["MACD"] <= prev["MACD_signal"]:
@@ -431,7 +503,6 @@ if run and ticker:
         if score_today < 0 and score_yesterday >= 0:
             sell_triggers.append("総合スコアがマイナス転換（フィルタ後）")
 
-        # 日足トレンド注記
         if daily_trend == "bull":
             buy_triggers.append("日足が上向き")
         elif daily_trend == "bear":
@@ -446,7 +517,6 @@ if run and ticker:
         if not buy_triggers and not sell_triggers:
             st.markdown("<div style='background:#555;padding:8px;border-radius:6px'><b style='color:white'>⚪ 転換シグナルなし</b></div>", unsafe_allow_html=True)
 
-        # ATR目安表示
         st.markdown("<div style='margin-top:10px'><b style='color:white'>🎯 ATR目安（エントリー＝最新終値）</b></div>", unsafe_allow_html=True)
         if bias == "long":
             st.write(f"ロング想定：SL **{long_sl:.2f}** / TP **{long_tp:.2f}**（ATR={atr:.2f}）")
@@ -487,7 +557,6 @@ if run and ticker:
         atr_pct = float(latest["ATR"] / latest["Close"]) * 100 if latest["Close"] != 0 else 0
         signals.append((f"⚠️ ATR {atr_pct:.1f}%（{'高ボラ' if atr_pct > 3 else '普通'}）", "neutral"))
 
-        # 日足トレンド表示
         if daily_trend == "bull":
             signals.append(("🟢 日足トレンド上向き", "buy"))
         elif daily_trend == "bear":
