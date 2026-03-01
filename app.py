@@ -16,7 +16,7 @@ st.title("📈 株売買シグナルアプリ")
 # =========================
 def is_jp_equity(ticker: str) -> bool:
     t = (ticker or "").upper().strip()
-    return t.endswith(".T")  # 東証の簡易判定
+    return t.endswith(".T")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -32,9 +32,9 @@ def cached_download(ticker: str, interval: str, period: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_4h_usual_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
-    """米株など：1分足を4Hにresample"""
-    days = max(1, min(int(days), 7))
+def fetch_4h_usual_from_1m(ticker: str, days: int = 30) -> pd.DataFrame:
+    """米株など：1分足を4Hにresample（Yahooが1分足を返さない/少ない場合は空になり得る）"""
+    days = max(1, min(int(days), 30))
     df_1m = yf.download(ticker, interval="1m", period=f"{days}d", progress=False)
     if df_1m is None or df_1m.empty:
         return pd.DataFrame()
@@ -55,9 +55,12 @@ def fetch_4h_usual_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_jp_4h_sessions_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
-    """日本株：前場/後場を各1本にまとめる（2本/日）。市場外・夜はYahooが1分足を返さない場合あり。"""
-    days = max(1, min(int(days), 7))
+def fetch_jp_4h_sessions_from_1m(ticker: str, days: int = 30) -> pd.DataFrame:
+    """
+    日本株：前場/後場を各1本にまとめる（2本/日）。
+    夜・休日・海外サーバー等の条件で Yahoo が 1分足を返さず空になり得る。
+    """
+    days = max(1, min(int(days), 30))
     df = yf.download(ticker, interval="1m", period=f"{days}d", progress=False)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -75,7 +78,7 @@ def fetch_jp_4h_sessions_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
             "High": x["High"].max(),
             "Low": x["Low"].min(),
             "Close": x["Close"].iloc[-1],
-            "Volume": x["Volume"].sum(),
+            "Volume": x.get("Volume", pd.Series([0]*len(x))).sum() if "Volume" in x else 0,
         })
 
     if morning.empty and afternoon.empty:
@@ -84,7 +87,7 @@ def fetch_jp_4h_sessions_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
     df_m = morning.groupby(morning.index.date).apply(ohlcv) if not morning.empty else pd.DataFrame()
     df_a = afternoon.groupby(afternoon.index.date).apply(ohlcv) if not afternoon.empty else pd.DataFrame()
 
-    # 見た目の時刻ラベル
+    # 表示上の時刻ラベル
     if not df_m.empty:
         df_m.index = pd.to_datetime(df_m.index) + pd.Timedelta(hours=11, minutes=30)
     if not df_a.empty:
@@ -94,84 +97,85 @@ def fetch_jp_4h_sessions_from_1m(ticker: str, days: int = 7) -> pd.DataFrame:
     return df_4h
 
 
-def make_pseudo_4h_from_daily(df_daily: pd.DataFrame) -> pd.DataFrame:
+def make_pseudo_4h_from_daily(df_daily: pd.DataFrame, parts_per_day: int = 4) -> pd.DataFrame:
     """
-    日本株用フォールバック：
-    日足を「前場」「後場」相当に2分割した疑似4H（夜・休日でも必ず出す）
+    フォールバック用「疑似4H」生成：
+    - parts_per_day=2 : 日本株を想定（前場/後場の2本/日）
+    - parts_per_day=4 : 米株などを想定（4本/日）
+
+    注意：
+    日足しか取れない状況で「必ず4Hを表示する」ための近似です。
+    値動きを Open→Close の線形補間で分割し、High/Low は日足を共用します。
     """
-    df_daily = df_daily.copy()
     if df_daily is None or df_daily.empty:
         return pd.DataFrame()
 
-    if isinstance(df_daily.columns, pd.MultiIndex):
-        df_daily.columns = df_daily.columns.get_level_values(0)
+    df = df_daily.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna()
+    df.index = pd.to_datetime(df.index)
 
-    df_daily = df_daily.dropna()
-    df_daily.index = pd.to_datetime(df_daily.index)
+    parts_per_day = int(parts_per_day)
+    if parts_per_day not in (2, 4):
+        parts_per_day = 4
+
+    # 表示用の時刻ラベル（ローカルタイムに厳密一致ではなく、日内の順序が分かるラベル）
+    # 2本：11:30 / 15:00
+    # 4本：10:30 / 14:30 / 18:30 / 22:30
+    if parts_per_day == 2:
+        time_offsets = [
+            pd.Timedelta(hours=11, minutes=30),
+            pd.Timedelta(hours=15),
+        ]
+    else:
+        time_offsets = [
+            pd.Timedelta(hours=10, minutes=30),
+            pd.Timedelta(hours=14, minutes=30),
+            pd.Timedelta(hours=18, minutes=30),
+            pd.Timedelta(hours=22, minutes=30),
+        ]
 
     rows = []
-    for idx, r in df_daily.iterrows():
+    for idx, r in df.iterrows():
         o = float(r["Open"])
         h = float(r["High"])
         l = float(r["Low"])
         c = float(r["Close"])
         v = float(r.get("Volume", 0.0))
 
-        mid = (o + c) / 2.0
+        # Open->Closeをpartsに分割（線形補間）
+        # 2本なら mid を挟む、4本なら 0%,25%,50%,75%,100%
+        if parts_per_day == 2:
+            closes = [(o + c) / 2.0, c]
+            opens = [o, (o + c) / 2.0]
+        else:
+            p0 = o
+            p1 = o + (c - o) * 0.25
+            p2 = o + (c - o) * 0.50
+            p3 = o + (c - o) * 0.75
+            p4 = c
+            opens = [p0, p1, p2, p3]
+            closes = [p1, p2, p3, p4]
 
-        # 前場（11:30）
-        rows.append({
-            "Datetime": idx + pd.Timedelta(hours=11, minutes=30),
-            "Open": o,
-            "High": h,
-            "Low": l,
-            "Close": mid,
-            "Volume": v / 2.0
-        })
+        vol_each = v / float(parts_per_day) if parts_per_day > 0 else 0.0
 
-        # 後場（15:00）
-        rows.append({
-            "Datetime": idx + pd.Timedelta(hours=15),
-            "Open": mid,
-            "High": h,
-            "Low": l,
-            "Close": c,
-            "Volume": v / 2.0
-        })
+        for i in range(parts_per_day):
+            rows.append({
+                "Datetime": idx + time_offsets[i],
+                "Open": float(opens[i]),
+                "High": h,
+                "Low": l,
+                "Close": float(closes[i]),
+                "Volume": vol_each
+            })
 
-    df = pd.DataFrame(rows).set_index("Datetime")
-    df = df.sort_index().dropna()
-    return df
+    out = pd.DataFrame(rows).set_index("Datetime")
+    out = out.sort_index().dropna()
+    return out
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_4h_auto(ticker: str, days: int = 7) -> pd.DataFrame:
-    """
-    4H自動：
-    - 日本株（.T）: まず1分足→前場/後場を試す
-      失敗したら 日足→疑似4H にフォールバック（夜・休日でも必ず表示）
-    - それ以外: 1分足→通常4H
-    """
-    days = max(1, min(int(days), 7))
-
-    if is_jp_equity(ticker):
-        # ① まず本物（1分足→前場/後場）
-        df = fetch_jp_4h_sessions_from_1m(ticker, days=days)
-        if df is not None and not df.empty:
-            return df
-
-        # ② フォールバック（日足→疑似4H）
-        df_daily = cached_download(ticker, interval="1d", period="60d")
-        if df_daily is not None and not df_daily.empty:
-            return make_pseudo_4h_from_daily(df_daily)
-
-        return pd.DataFrame()
-
-    # 米株など
-    return fetch_4h_usual_from_1m(ticker, days=days)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_company_name_optional(ticker: str) -> str:
     """yfinance .info は重いので任意＆キャッシュ"""
     try:
@@ -179,6 +183,43 @@ def fetch_company_name_optional(ticker: str) -> str:
         return info.get("longName") or info.get("shortName") or ticker
     except:
         return ticker
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_4h_auto(ticker: str, days: int = 30) -> tuple[pd.DataFrame, str]:
+    """
+    4H自動（完全安定版）
+    - 日本株（.T）: まず1分足→前場/後場（本物 2本/日）
+      失敗/不足なら 日足→疑似4H（2本/日）
+    - 米株等: まず1分足→4H（本物）
+      失敗/不足なら 日足→疑似4H（4本/日）
+
+    戻り値: (df, mode)
+      mode: "native" or "pseudo"
+    """
+    days = max(1, min(int(days), 30))
+
+    if is_jp_equity(ticker):
+        df_native = fetch_jp_4h_sessions_from_1m(ticker, days=days)
+        if df_native is not None and len(df_native) >= 4:
+            return df_native, "native"
+
+        df_daily = cached_download(ticker, interval="1d", period="180d")
+        if df_daily is not None and not df_daily.empty:
+            return make_pseudo_4h_from_daily(df_daily, parts_per_day=2), "pseudo"
+
+        return pd.DataFrame(), "none"
+
+    # 米株など
+    df_native = fetch_4h_usual_from_1m(ticker, days=days)
+    if df_native is not None and len(df_native) >= 4:
+        return df_native, "native"
+
+    df_daily = cached_download(ticker, interval="1d", period="180d")
+    if df_daily is not None and not df_daily.empty:
+        return make_pseudo_4h_from_daily(df_daily, parts_per_day=4), "pseudo"
+
+    return pd.DataFrame(), "none"
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -216,6 +257,7 @@ def add_daily_trend(df_daily: pd.DataFrame) -> pd.DataFrame:
 
 def calc_score(row, prev_row):
     s = 0
+
     # EMA
     s += 1 if row["EMA21"] > row["EMA50"] else -1
 
@@ -234,7 +276,7 @@ def calc_score(row, prev_row):
     elif row["Close"] > row["BB_upper"]:
         s -= 1
 
-    # OBV（微差ノイズを抑える）
+    # OBV（微差ノイズ抑制）
     obv_delta = row["OBV"] - prev_row["OBV"]
     thresh = abs(prev_row["OBV"]) * 0.001 if abs(prev_row["OBV"]) > 0 else 0
     if obv_delta > thresh:
@@ -279,7 +321,7 @@ timeframe = st.sidebar.selectbox(
 
 timeframe_map = {
     "1時間足": {"type": "yahoo", "interval": "1h", "period": "60d"},
-    "4時間足（自動）": {"type": "4h_auto", "days": 7},
+    "4時間足（自動）": {"type": "4h_auto", "days": 30},   # ★増やして安定
     "日足": {"type": "yahoo", "interval": "1d", "period": "1y"},
     "週足": {"type": "yahoo", "interval": "1wk", "period": "5y"},
     "月足": {"type": "yahoo", "interval": "1mo", "period": "10y"},
@@ -294,6 +336,7 @@ sl_mult = st.sidebar.slider("損切り ATR倍率", 0.5, 3.0, 1.5, 0.1)
 tp_mult = st.sidebar.slider("利確 ATR倍率", 1.0, 6.0, 2.5, 0.1)
 show_risk_lines = st.sidebar.toggle("ATRライン（SL/TP）をチャート表示", value=True)
 
+# 実行
 run = st.sidebar.button("分析開始") or auto_run
 
 # =========================
@@ -303,10 +346,18 @@ if run and ticker:
     params = timeframe_map[timeframe]
 
     with st.spinner("データ取得中..."):
+        mode_label = ""
         if params["type"] == "4h_auto":
-            df = fetch_4h_auto(ticker, days=params.get("days", 7))
+            df, mode = fetch_4h_auto(ticker, days=params.get("days", 30))
+            if mode == "native":
+                mode_label = "（4H: 本物）"
+            elif mode == "pseudo":
+                mode_label = "（4H: 疑似/日足フォールバック）"
+            else:
+                mode_label = "（4H: 取得失敗）"
         else:
             df = cached_download(ticker, interval=params["interval"], period=params["period"])
+            mode_label = ""
 
         # 日足（長期トレンド判定用）
         df_daily = cached_download(ticker, interval="1d", period="5y")
@@ -320,18 +371,18 @@ if run and ticker:
         st.error("データが取得できませんでした。ティッカーや時間足を確認してください。")
         st.stop()
 
+    # 指標計算
+    df = add_indicators(df)
+    if len(df) < 4:
+        st.warning("⚠️ データが少なすぎます。別の時間足をお試しください。")
+        st.stop()
+
     # 日足トレンド判定
     daily_trend = "neutral"
     if df_daily is not None and not df_daily.empty and len(df_daily) >= 250:
         df_daily_tr = add_daily_trend(df_daily)
         if not df_daily_tr.empty:
             daily_trend = df_daily_tr.iloc[-1]["daily_trend"]
-
-    # 指標計算
-    df = add_indicators(df)
-    if len(df) < 4:
-        st.warning("⚠️ データが少なすぎます。別の時間足をお試しください。")
-        st.stop()
 
     # トレンド判定
     df["trend"] = "neutral"
@@ -379,7 +430,7 @@ if run and ticker:
     <div style='background:#1a1a2e;padding:8px 15px;border-radius:8px;
     display:flex;align-items:center;gap:20px;margin-bottom:8px'>
     <span style='color:white;font-size:16px;font-weight:bold'>{company_name}</span>
-    <span style='color:gray;font-size:13px'>{ticker} · {timeframe}</span>
+    <span style='color:gray;font-size:13px'>{ticker} · {timeframe} {mode_label}</span>
     <span style='color:{price_color};font-size:18px;font-weight:bold'>
     {current_price:.2f} {price_arrow} {abs(price_change):.2f} ({price_pct:+.2f}%)</span>
     <span style='color:white;font-size:13px'>{daily_trend_label}</span>
